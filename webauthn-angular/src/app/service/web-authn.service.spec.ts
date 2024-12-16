@@ -1,13 +1,13 @@
 import { TestBed } from '@angular/core/testing';
 
-import { WebauthnService } from './webauthn.service';
+import { WebAuthnService } from './web-authn.service';
 
-describe('WebauthnService', () => {
-  let service: WebauthnService;
+describe('WebAuthnService', () => {
+  let service: WebAuthnService;
 
   beforeEach(() => {
     TestBed.configureTestingModule({});
-    service = TestBed.inject(WebauthnService);
+    service = TestBed.inject(WebAuthnService);
   });
 
   it('should be created', () => {

@@ -1,112 +1,197 @@
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
+const cookieParser = require('cookie-parser');
 const {
   generateRegistrationOptions,
   verifyRegistrationResponse,
   generateAuthenticationOptions,
-  verifyAuthenticationResponse
+  verifyAuthenticationResponse,
 } = require('@simplewebauthn/server');
-const { isoUint8Array } = require('@simplewebauthn/server/helpers');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const PORT = process.env.PORT || 3001; // Changed port to avoid conflicts
 
-let users = {}; // In-memory user store
+// Middleware
+app.use(express.json());
+app.use(cookieParser());
+app.use(cors({
+  origin: 'http://localhost:4200', // Angular default port
+  credentials: true
+}));
 
-// Generate registration options
-app.post('/register', (req, res) => {
-  const username = req.body.username;
-  console.log(username);
-  const userId = uuidv4(); // Generate unique user ID
+// In-memory user storage (replace with database in production)
+const USERS = [];
 
-  const options = generateRegistrationOptions({
-    rpName: "Your App Name",
-    rpID: "localhost",
-    userID: isoUint8Array.fromUTF8String(userId),
-    userName: username,
-    userDisplayName: username,
+// Helper functions
+function getUserByEmail(email) {
+  return USERS.find(user => user.email === email);
+}
+
+function getUserById(id) {
+  return USERS.find(user => user.id === id);
+}
+
+function createUser(id, email, passKey) {
+  USERS.push({ id, email, passKey });
+}
+
+function updateUserCounter(id, counter) {
+  const user = USERS.find(user => user.id === id);
+  if (user) {
+    user.passKey.counter = counter;
+  }
+}
+
+// WebAuthn Registration Routes
+app.get('/init-register', async (req, res) => {
+  const { email } = req.query;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  if (getUserByEmail(email)) {
+    return res.status(400).json({ error: 'User already exists' });
+  }
+
+  const options = await generateRegistrationOptions({
+    rpName: 'WebAuthn Demo',
+    rpID: 'localhost',
+    userName: email,
+    userDisplayName: email,
   });
 
-  // Store user with challenge
-  users[userId] = {
-    username,
+  res.cookie('registrationChallenge', JSON.stringify({
     challenge: options.challenge,
-    credentials: []
-  };
-  console.log(users[userId]);
-  console.log(options);
+    userId: options.user.id,
+    email
+  }), {
+    httpOnly: true,
+    secure: false, // Set to true in production
+    sameSite: 'lax',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
   res.json(options);
 });
 
-// Verify registration response
-app.post('/verify-registration', (req, res) => {
-  const { id, response } = req.body; // Expect `id` from client
-  const user = users[id];
-
-  if (!user) {
-    return res.status(404).send('User not found');
+app.post('/verify-register', async (req, res) => {
+  const registrationCookie = req.cookies.registrationChallenge;
+  
+  if (!registrationCookie) {
+    return res.status(400).json({ error: 'No registration challenge found' });
   }
 
-  const verification = verifyRegistrationResponse({
-    response,
-    expectedChallenge: user.challenge,
-    expectedOrigin: "http://localhost:4200",
-    expectedRPID: "localhost",
-  });
+  const { challenge, userId, email } = JSON.parse(registrationCookie);
 
-  if (verification.verified) {
-    user.credentials.push(verification.registrationInfo);
-    res.status(200).send("Registration verified successfully!");
-  } else {
-    res.status(400).send("Verification failed.");
+  try {
+    const verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge: challenge,
+      expectedOrigin: 'http://localhost:4200',
+      expectedRPID: 'localhost',
+    });
+
+    if (verification.verified) {
+      createUser(userId, email, {
+        id: verification.registrationInfo.credentialID,
+        publicKey: verification.registrationInfo.credentialPublicKey,
+        counter: verification.registrationInfo.counter,
+      });
+
+      res.clearCookie('registrationChallenge');
+      return res.json({ verified: true });
+    }
+
+    return res.status(400).json({ verified: false, error: 'Registration verification failed' });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Server error during registration' });
   }
 });
 
-// Generate authentication options
-app.post('/login', (req, res) => {
-  const username = req.body.username;
-  const user = Object.values(users).find(u => u.username === username);
+// WebAuthn Authentication Routes
+app.get('/init-auth', async (req, res) => {
+  const { email } = req.query;
 
-  if (!user) {
-    return res.status(404).send("User not found");
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
   }
 
-  const options = generateAuthenticationOptions({
-    allowCredentials: user.credentials.map(cred => ({
-      id: cred.credentialID,
+  const user = getUserByEmail(email);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  const options = await generateAuthenticationOptions({
+    rpID: 'localhost',
+    allowCredentials: [{
+      id: user.passKey.id,
       type: 'public-key',
-    })),
+    }],
   });
 
-  // Store challenge for login verification
-  user.challenge = options.challenge;
+  res.cookie('authChallenge', JSON.stringify({
+    challenge: options.challenge,
+    userId: user.id
+  }), {
+    httpOnly: true,
+    secure: false, // Set to true in production
+    sameSite: 'lax',
+    maxAge: 5 * 60 * 1000 // 5 minutes
+  });
+
   res.json(options);
 });
 
-// Verify authentication response
-app.post('/verify-login', (req, res) => {
-  const { id, response } = req.body; // Expect `id` from client
-  const user = users[id];
-
-  if (!user) {
-    return res.status(404).send('User not found');
+app.post('/verify-auth', async (req, res) => {
+  const authCookie = req.cookies.authChallenge;
+  
+  if (!authCookie) {
+    return res.status(400).json({ error: 'No authentication challenge found' });
   }
 
-  const verification = verifyAuthenticationResponse({
-    response,
-    expectedChallenge: user.challenge,
-    expectedOrigin: "http://localhost:4200",
-    expectedRPID: "localhost",
-  });
+  const { challenge, userId } = JSON.parse(authCookie);
+  const user = getUserById(userId);
 
-  if (verification.verified) {
-    res.status(200).send("Login verified successfully!");
-  } else {
-    res.status(400).send("Login verification failed.");
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: req.body,
+      expectedChallenge: challenge,
+      expectedOrigin: 'http://localhost:4200',
+      expectedRPID: 'localhost',
+      authenticator: {
+        credentialID: user.passKey.id,
+        credentialPublicKey: user.passKey.publicKey,
+        counter: user.passKey.counter,
+      },
+    });
+
+    if (verification.verified) {
+      updateUserCounter(userId, verification.authenticationInfo.newCounter);
+      res.clearCookie('authChallenge');
+      return res.json({ verified: true });
+    }
+
+    return res.status(400).json({ verified: false, error: 'Authentication verification failed' });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Server error during authentication' });
   }
 });
 
-app.listen(3000, () => console.log('Server running on http://localhost:3000'));
+// Error handling for port in use
+const server = app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+}).on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.log(`Port ${PORT} is already in use. Please kill the process or change the port.`);
+    process.exit(1);
+  }
+});
+
+module.exports = app;
